@@ -1,221 +1,216 @@
 import pandas as pd
 import numpy as np
 import requests
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
-import follium
+from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+import folium
+import polyline
 
-def solve_routing_problem():
-    # ==============================================================================
-    # PHASE 1: DATA GENERATION
-    # ==============================================================================
-    print("--- Phase 1: Generating Data ---")
-    DEPOT_COORDINATES = [12.93580, 77.62590]
-    NUM_ORDERS = 50
-    VEHICLE_CAPACITY = 5 # capacity to hold bags i.e 1 vehicle can carry 5 bags
-    NUM_VEHICLES = 12  # Start with some slack
+# ======================================================================================================================
+# THIS FILE IS COMBINATION OF generate_data.py, basline_solver.py, advanced_solver.py
+# FOR MORE DETAILED EXPLANATION OF CODE, REFER THE FILES MENTIONED ABOVE
+# ======================================================================================================================
 
-    # ===============================================================================
-    # ADDITIONAL CONSTRAINTS
-    # ===============================================================================
-    MAX_ROUTE_TIME_HOURS = 10.0 # max time of vehicle
-    MIN_ROUTE_TIME_HOURS = 0.5  # min time of vehicle (this is according to labour law of INDIA)
-    MAX_ROUTE_TIME_SECONDS = int(MAX_ROUTE_TIME_HOURS * 3600)
-    MIN_ROUTE_TIME_SECONDS = int(MIN_ROUTE_TIME_HOURS * 3600)
+def solve_complete_project_with_viz():
+    # --- Phase 1 & 2: Prep and Data Creation ---
+    print(">>> Starting VRP project (data + pre-processing)...")
 
-    # ... (The rest of the data generation code is the same)
-    order_locations = []
-    for i in range(NUM_ORDERS):
-        r = (4.0 / 111.1) * np.sqrt(np.random.rand())
-        theta = 2 * np.pi * np.random.rand()
-        order_locations.append({'OriginalOrderID': i + 1, 'Latitude': DEPOT_COORDINATES[0] + r * np.cos(theta),
-                                'Longitude': DEPOT_COORDINATES[1] + r * np.sin(theta)})
+    # Depot location (just picking a random point in Bangalore for now)
+    DEPOT_LOCATION = [12.93580, 77.62590]
 
-    orders_df = pd.DataFrame(order_locations)
-    all_coords = [DEPOT_COORDINATES] + list(zip(orders_df['Latitude'], orders_df['Longitude']))
-    all_coords_lon_lat = [[lon, lat] for lat, lon in all_coords]
-    coords_string = ";".join([f"{lon},{lat}" for lon, lat in all_coords_lon_lat])
-    url = f"http://router.project-osrm.org/table/v1/driving/{coords_string}?annotations=duration"
+    # Configs (these are pretty arbitrary, I might tune later)
+    NUM_CUSTOMERS = 50
+    VEH_CAPACITY = 8
+    FLEET_SIZE = 12
+    DELIVERY_WINDOW_HOURS = 3   # each customer needs to be served in 3 hrs
+    MAX_ROUTE_SEC = 10 * 3600   # 10 hours in seconds
 
+    # Generate customer "fake" coordinates near depot
+    customer_points = []
+    for cid in range(NUM_CUSTOMERS):
+        # random radial spread within ~4 km
+        dx = (4.0 / 111.1) * np.sqrt(np.random.rand())
+        angle = 2 * np.pi * np.random.rand()
+        customer_points.append({
+            "OriginalOrderID": cid + 1,
+            "Latitude": DEPOT_LOCATION[0] + dx * np.cos(angle),
+            "Longitude": DEPOT_LOCATION[1] + dx * np.sin(angle)
+        })
+
+    ordersTable = pd.DataFrame(customer_points)
+
+    # Combine depot + orders into one big list
+    all_nodes = [DEPOT_LOCATION] + list(zip(ordersTable["Latitude"], ordersTable["Longitude"]))
+
+    # --- Step: Fetch OSRM matrix ---
     try:
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()
-        time_matrix_raw = response.json()['durations']
-    except Exception as e:
-        print(f"FATAL ERROR: Could not get data from OSRM API. {e}")
+        # NOTE: OSRM expects lon,lat not lat,lon
+        node_pairs = [[lon, lat] for lat, lon in all_nodes]
+        coords_str = ";".join([f"{lon},{lat}" for lon, lat in node_pairs])
+
+        req_url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=duration"
+        resp = requests.get(req_url, timeout=60)
+        resp.raise_for_status()
+
+        raw_matrix = resp.json()["durations"]
+
+    except Exception as oops:
+        print(f"!!! Big failure while hitting OSRM: {oops}")
         return
 
-    # ==============================================================================
-    # PHASE 1.5: DEFINE TIME
-    # ==============================================================================
-    # Let's us assume the depot is open all day (eg: 10 hours)
-    # and all deliveries must be made within 1 hour (3600 seconds) of the start
-    time_windows = [(0, 10800)] * (NUM_ORDERS + 1)
-    time_windows[0] = (0, 10800) # Depot window: 10 hours
-    print("Defined delivery time windows (0 to 3600 seconds for customers).")
+    # --- Cleaning OSRM data ---
+    # some nodes might be unreachable → handle them gracefully
+    penalty_time = 999999
+    ok_indices = [i for i, row in enumerate(raw_matrix) if raw_matrix[i][0] is not None and raw_matrix[0][i] is not None]
+    bad_nodes = [i for i in range(NUM_CUSTOMERS + 1) if i not in ok_indices and i != 0]
 
+    if bad_nodes:
+        print(f"Warning: found {len(bad_nodes)} unreachable customer(s) → {bad_nodes}")
 
-    # ==============================================================================
-    # PHASE 2: DATA PRE-PROCESSING (THE NEW, GUARANTEED FIX)
-    # ==============================================================================
-    print("\n--- Phase 2: Pre-processing Data to Remove Unreachable Nodes ---")
+    usable_matrix = np.array(raw_matrix)[np.ix_(ok_indices, ok_indices)]
+    usable_matrix[usable_matrix == None] = penalty_time   # clunky but works
+    usable_time_matrix = usable_matrix.astype(np.int64)
 
-    penalty_value = 999999
-    # Node indices are 0 for depot, 1 to 50 for customers
-    all_node_indices = list(range(NUM_ORDERS + 1))
+    usable_orders = ordersTable[ordersTable["OriginalOrderID"].isin(ok_indices)]
 
-    reachable_indices = []
-    unreachable_nodes = []
+    # --- OR-Tools Setup ---
+    print("\n>>> Phase 3: Kicking off OR-Tools solver <<<")
 
-    for i in all_node_indices:
-        # A node is reachable if it can get to the depot AND the depot can get to it.
-        is_reachable = (time_matrix_raw[i][0] is not None) and (time_matrix_raw[0][i] is not None)
-        if is_reachable:
-            reachable_indices.append(i)
-        elif i != 0:  # Don't list the depot as unreachable
-            unreachable_nodes.append(i)
+    num_nodes = len(usable_time_matrix)
+    mgr = pywrapcp.RoutingIndexManager(num_nodes, FLEET_SIZE, 0)
+    router = pywrapcp.RoutingModel(mgr)
 
-    print(f"Identified {len(unreachable_nodes)} unreachable customer(s): {unreachable_nodes}")
-    print(f"Proceeding with {len(reachable_indices) - 1} reachable customers.")
+    # travel time callback
+    def travel_time_cb(from_i, to_i):
+        return usable_time_matrix[mgr.IndexToNode(from_i)][mgr.IndexToNode(to_i)]
 
-    # Create a new, clean time matrix and orders list
-    clean_time_matrix = np.array(time_matrix_raw)[np.ix_(reachable_indices, reachable_indices)]
-    # Replace any remaining Nones (e.g. between two island customers)
-    clean_time_matrix[clean_time_matrix == None] = penalty_value
-    clean_time_matrix = clean_time_matrix.astype(np.int64)
+    transit_cb = router.RegisterTransitCallback(travel_time_cb)
+    router.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
-    # Map old indices to new indices (0, 1, 2, 3...)
-    new_idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(reachable_indices)}
+    # add time dimension
+    router.AddDimension(transit_cb, 0, MAX_ROUTE_SEC, True, "Time")
+    time_dim = router.GetDimensionOrDie("Time")
 
-    # ==============================================================================
-    # PHASE 3: SOLVING THE CLEANED PROBLEM
-    # ==============================================================================
-    print("\n--- Phase 3: Solving the Cleaned Problem with OR-Tools ---")
+    # capacity stuff
+    load = [1] * num_nodes
+    load[0] = 0  # depot has no demand
 
-    # Create the routing model on the CLEANED data
-    num_locations = len(clean_time_matrix)
-    manager = pywrapcp.RoutingIndexManager(num_locations, NUM_VEHICLES, 0)  # Depot is always index 0
-    routing = pywrapcp.RoutingModel(manager)
+    def load_cb(from_i):
+        return load[mgr.IndexToNode(from_i)]
 
-    # --- Add Constraints ---
-    def time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return clean_time_matrix[from_node][to_node]
+    load_cb_id = router.RegisterUnaryTransitCallback(load_cb)
+    router.AddDimensionWithVehicleCapacity(load_cb_id, 0, [VEH_CAPACITY] * FLEET_SIZE, True, "Capacity")
 
-    transit_callback_index = routing.RegisterTransitCallback(time_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    # Add time windows (pretty strict for customers, depot gets full horizon)
+    win = [(0, int(DELIVERY_WINDOW_HOURS * 3600))] * num_nodes
+    win[0] = (0, MAX_ROUTE_SEC)
 
-    # ============================================================================
-    # ADDING THE TIME DIMENSION
-    # ============================================================================
-    dimension_name = 'Time'
-    routing.AddDimension(
-        transit_callback_index,
-        0, # no slack
-         MAX_ROUTE_TIME_SECONDS, # Vehicle maximum travel time (10 hours)
-        True, # Start cumul to zero
-        dimension_name)
-    time_dimension = routing.GetDimensionOrDie(dimension_name)
+    for k in range(num_nodes):
+        time_dim.CumulVar(mgr.NodeToIndex(k)).SetRange(win[k][0], win[k][1])
 
-    demands = [1] * num_locations
-    demands[0] = 0  # Depot demand is 0
+    # Force solver to consider minimizing start times too (helps tighten windows)
+    for v in range(FLEET_SIZE):
+        router.AddVariableMinimizedByFinalizer(time_dim.CumulVar(router.Start(v)))
 
-    def demand_callback(from_index):
-        return demands[manager.IndexToNode(from_index)]
+    # search params
+    opts = pywrapcp.DefaultRoutingSearchParameters()
+    opts.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    opts.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    opts.time_limit.FromSeconds(30)
 
-    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [VEHICLE_CAPACITY] * NUM_VEHICLES, True,
-                                            'Capacity')
+    sol = router.SolveWithParameters(opts)
 
-    # ============================================================================
-    # APPLY TIME WINDOW CONSTRAINTS
-    # ============================================================================
-    # this maps our original node indices (e.g., customer 45) to the cleaned list indices (e.g 41)
-    original_indices_list = list(reachable_indices)
-
-    # Add time window constraints for each location except the depot
-    for original_location_idx, time_window in enumerate(time_windows):
-        if original_location_idx == 0:  # Skip depot
-            continue
-        # We only add constraints for nodes that are reachable
-        if original_location_idx in original_indices_list:
-            # Find th new, cleaned index for this location
-            new_index = original_indices_list.index(original_location_idx)
-            index = manager.NodeToIndex(new_index)
-            time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
-
-    # Add the time window constraints for each vehicles start node (the depot)
-    for vehicle_id in range(NUM_VEHICLES):
-        index = routing.Start(vehicle_id)
-        time_dimension.CumulVar(index).SetRange(time_windows[0][0], time_windows[0][1])
-
-    # ===================================================================================
-    # ADD MINIMUM TIME CONSTRAINT
-    # ===================================================================================
-    # Add a minimum work time for each vehicle that is used
-    for vehicle_id in range(NUM_VEHICLES):
-        index = routing.End(vehicle_id)
-        # This line gets the variable representing the total time of a vehicles route
-        route_time_variable = time_dimension.CumulVar(index)\
-
-        # This line gets the variable representing if a vehicle is used (1) or not (0)
-        vehicle_active_variable = routing.ActiveVar(vehicle_id)
-
-        # Add the constraints: RouteTime >= MinTime * IsVehicleActive
-        routing.solver().Add(route_time_variable >= (MIN_ROUTE_TIME_SECONDS * vehicle_active_variable))
-
-
-    # --- Set Search Parameters and Solve ---
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.FromSeconds(30)
-
-    solution = routing.SolveWithParameters(search_parameters)
-
-    # --- Print Solution ---
-    if solution:
-        print("\n--- Final Optimized Solution ---")
-        total_time = 0
-        total_routes = 0
-        original_indices = np.array(list(reachable_indices))
-        for vehicle_id in range(NUM_VEHICLES):
-            index = routing.Start(vehicle_id)
-            if routing.IsEnd(solution.Value(routing.NextVar(index))):
-                continue  # Skip unused vehicles
-
-            total_routes += 1
-            route_nodes = []
-            route_time = 0
-            while not routing.IsEnd(index):
-                node_index = manager.IndexToNode(index)
-                route_nodes.append(int(original_indices[node_index]))
-                previous_index = index
-                index = solution.Value(routing.NextVar(index))
-                route_time += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
-
-            route_nodes.append(0)  # End at depot
-            print(
-                f"Route {vehicle_id} ({len(route_nodes) - 2} stops): {' -> '.join(map(str, route_nodes))} | Time: {route_time}s")
-            total_time += route_time
-
-        print(f"\nTotal Number of Routes: {total_routes}")
-        print(f"Total Travel Time: {total_time}s ({total_time / 3600:.2f} hours)")
+    if sol:
+        routes = print_solution(sol, mgr, router, usable_time_matrix, ok_indices)
+        create_solution_map(routes, usable_orders, DEPOT_LOCATION)
     else:
-        print("No solution found!")
+        print("\n!!! No solution found :( !!!")
 
-# Run the entire project
-solve_routing_problem()
 
-# Average Route Calculation
-''' 
-Average Route Time = Total Travel Time / Total Number of Routes
-Total Travel Time = 21745 seconds
-Total Number of Routes = 12
-Average Route Time - 21745 seconds / 12 routes
-Average Route Time = 1812 seconds
-1812 / 60 = 30.2 minutes
-Therefor (Average Route Time = 30.2 Minutes
+# ------------------------------------------------------------------------------
+# Map builder (Folium + OSRM route API)
+# ------------------------------------------------------------------------------
+def create_solution_map(routes, ordersTable, depot_coords):
+    print("\n>>> Drawing solution on a folium map...")
 
-'''
+    mymap = folium.Map(location=depot_coords, zoom_start=14)
+    folium.Marker(depot_coords, popup="Depot (0)", icon=folium.Icon(color="red", icon="home")).add_to(mymap)
+
+    # cycling through colors... eventually should expand this if fleet is bigger
+    palette = ["blue", "green", "purple", "orange", "darkred", "lightred",
+               "beige", "darkblue", "darkgreen", "cadetblue", "pink", "lightblue"]
+
+    # map order IDs to coords for easy lookup
+    coord_lookup = ordersTable.set_index("OriginalOrderID").to_dict("index")
+    coord_lookup[0] = {"Latitude": depot_coords[0], "Longitude": depot_coords[1]}
+
+    for v, (vid, stops) in enumerate(routes.items()):
+        col = palette[v % len(palette)]
+        path_points = []
+
+        # get each leg geometry
+        for i in range(len(stops) - 1):
+            a, b = stops[i], stops[i + 1]
+            start = coord_lookup[a]
+            end = coord_lookup[b]
+
+            # small hack: OSRM wants lon,lat
+            url = f"http://router.project-osrm.org/route/v1/driving/{start['Longitude']},{start['Latitude']};{end['Longitude']},{end['Latitude']}?overview=full&geometries=polyline"
+            r = requests.get(url)
+            geom = r.json()["routes"][0]["geometry"]
+
+            path_points.extend(polyline.decode(geom))
+
+        folium.PolyLine(path_points, color=col, weight=3, opacity=0.8,
+                        popup=f"Vehicle {vid}").add_to(mymap)
+
+        # plot customers as circles
+        for cust in stops[1:-1]:
+            cc = [coord_lookup[cust]["Latitude"], coord_lookup[cust]["Longitude"]]
+            folium.CircleMarker(cc, radius=5, color=col, fill=True,
+                                popup=f"Customer {cust}<br><b>Vehicle {vid}</b>").add_to(mymap)
+
+    fname = "optimized_routes_map.html"
+    mymap.save(fname)
+    print(f">>> Map written to {fname}")
+
+
+# ------------------------------------------------------------------------------
+# Just printing the solver solution in a readable way
+# ------------------------------------------------------------------------------
+def print_solution(sol, mgr, router, time_matrix, ok_indices):
+    print("\n>>> Optimized Solution:")
+
+    total_time, active_routes = 0, 0
+    final_routes = {}
+    index_lookup = np.array(ok_indices)
+
+    for v in range(router.vehicles()):
+        idx = router.Start(v)
+        if router.IsEnd(sol.Value(router.NextVar(idx))):
+            continue  # skip unused vehicle
+
+        active_routes += 1
+        path, rtime = [], 0
+
+        while not router.IsEnd(idx):
+            nid = mgr.IndexToNode(idx)
+            path.append(int(index_lookup[nid]))
+            prev, idx = idx, sol.Value(router.NextVar(idx))
+            rtime += router.GetArcCostForVehicle(prev, idx, v)
+
+        path.append(0)
+        final_routes[v] = path
+        print(f"Veh {v}: {' -> '.join(map(str, path))} | Time {rtime}s")
+
+        total_time += rtime
+
+    print(f"\nRoutes used: {active_routes}")
+    print(f"Total time: {total_time}s ({total_time/3600:.2f} hrs)")
+    if active_routes > 0:
+        avg_t = total_time / active_routes
+        print(f"Avg route time: {int(avg_t)}s ({avg_t/60:.2f} min)")
+    return final_routes
+
+
+if __name__ == "__main__":
+    solve_complete_project_with_viz()
