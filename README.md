@@ -73,11 +73,11 @@ The worth of the optimised model was demonstrated by comparing it to a standard 
 
 ### Performance Comparison Table
 
-1. | Metric                               | Model A (Bad Data in Initial State) | Model B (Baseline Heuristic on Clean Data) | Model C (Final Advanced CVRPTW Model) |
-2. |:-------------------------------------|:------------------------------------|:-------------------------------------------|:--------------------------------------|
-3. | **Total Routes Used**                | 50                                  |  7                                         |  7                                    |
-4. | **Cumulative Travel Time (hours)**   | ~27,777                             | 3.64 hours                                 | 3.94 hours                            |
-5. | **Average Route Time (min)**         | N/A                                 | ~31.2 minutes                              | ~33.8 minutes                         |
+| Metric                             | Model A (Bad Data in Initial State) | Model B (Baseline Heuristic on Clean Data) | Model C (Final Advanced CVRPTW Model) |
+|------------------------------------|-------------------------------------|--------------------------------------------|---------------------------------------|
+| **Total Routes Used**              | 50                                  | 7                                          | 7                                     |
+| **Cumulative Travel Time (hours)** | ~27,777                             | 3.64 hours                                 | 3.94 hours                            |
+| **Average Route Time (min)**       | N/A                                 | ~31.2 minutes                              | ~33.8 minutes                         |
 
 ### Analysis
 
